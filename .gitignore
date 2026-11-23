@@ -1,0 +1,23 @@
+# Local environments & caches
+.venv/
+.direnv/
+.envrc
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets & confidential local documents (never commit)
+.env
+heartsounds_research_plan.pdf
+
+# Large local data & outputs (canonical copies live in gs://data-processed-dualregion/v2_curated/)
+data/
+outputs/
+*.parquet
+*.pkl
+*.pt
+*.pth

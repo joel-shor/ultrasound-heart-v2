@@ -1,0 +1,1 @@
+../../../.agents/skills/beaker/SKILL.md

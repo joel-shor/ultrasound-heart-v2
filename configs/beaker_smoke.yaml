@@ -1,0 +1,12 @@
+name: beaker_smoke
+folds: [0]
+
+optim:
+  epochs: 2
+  warmup_epochs: 1
+  early_stopping_patience: 2
+
+beaker:
+  gpus: 1
+  task_timeout: 1h
+  task_name: smoke

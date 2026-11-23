@@ -1,0 +1,51 @@
+name: base
+seed: 42
+folds: [0, 1, 2, 3, 4]
+output_dir: outputs/runs
+
+data:
+  data_dir: /data
+  sample_rate: 4000
+  train_window_seconds: 20.0
+  crops_per_recording_epoch: 2
+  batch_size: 32
+  eval_batch_size: 16
+  num_workers: 4
+  augment: true
+
+model:
+  name: waveform_mil
+  channels: 128
+  dropout: 0.25
+  topk_pool: 6
+  pretrained: true
+  backbone: convnext_small.fb_in22k
+
+optim:
+  lr: 0.001
+  backbone_lr_scale: 0.25
+  weight_decay: 0.01
+  epochs: 28
+  warmup_epochs: 3
+  grad_clip: 1.0
+  focal_gamma: 1.5
+  pos_weight_scale: 0.35
+  auc_loss_weight: 0.35
+  subtype_loss_weight: 0.15
+  mixup_alpha: 0.2
+  early_stopping_patience: 8
+  mixed_precision: true
+
+beaker:
+  cluster:
+    - ai1/octo.ai-aws-p5en
+    - ai1/aipbd-aws-h200
+    - ai1/octo-hub-aws-h200
+    - ai1/octo.ai-aws-g6e
+  gpus: 1
+  priority: high
+  shared_memory: 16GiB
+  docker_image: python:3.12-bookworm
+  task_timeout: 4h
+  task_name: train
+  install: UV_CACHE_DIR=/tmp/uv-cache uv sync --locked
