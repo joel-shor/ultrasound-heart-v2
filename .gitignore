@@ -15,8 +15,10 @@ build/
 heartsounds_research_plan.pdf
 
 # Large local data & outputs (canonical copies live in gs://data-processed-dualregion/v2_curated/)
-data/
-outputs/
+/data
+/data/
+/outputs
+/outputs/
 *.parquet
 *.pkl
 *.pt
