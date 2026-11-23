@@ -101,9 +101,15 @@ class DilatedConvNeXtBlock1D(nn.Module):
 
 
 class WaveformMILNet(nn.Module):
-    """End-to-end 1D waveform + multi-band envelope MIL classifier."""
+    """End-to-end 1D waveform + multi-band envelope MIL classifier.
 
-    DOWNSAMPLE_FACTOR = 16
+    Extracts fine morphology at 250 Hz (4 ms) via dilated ConvNeXt blocks, then pools 8x
+    (Max + Mean) to 31.25 Hz (32 ms, ~14 frames/beat) before the 2-layer BiGRU and MIL head
+    so sequential recurrence spans 8-15 consecutive cardiac cycles efficiently.
+    """
+
+    STEM_STRIDE = 16
+    RHYTHM_STRIDE = 8
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
@@ -125,12 +131,17 @@ class WaveformMILNet(nn.Module):
             nn.GELU(),
         )
 
-        dilations = (1, 2, 4, 8, 1, 2)
+        dilations = (1, 2, 4, 8, 16, 4)
         self.blocks = nn.ModuleList(
             [
                 DilatedConvNeXtBlock1D(ch, kernel_size=9, dilation=d, dropout=cfg.dropout)
                 for d in dilations
             ]
+        )
+        self.rhythm_proj = nn.Sequential(
+            nn.Conv1d(ch * 2, ch, kernel_size=3, padding=1),
+            ChannelLayerNorm1D(ch),
+            nn.GELU(),
         )
         self.gru = nn.GRU(
             input_size=ch,
@@ -167,7 +178,7 @@ class WaveformMILNet(nn.Module):
         x = self.fuse(torch.cat([w_feat[..., :t_frames], e_feat[..., :t_frames]], dim=1))
 
         frame_lengths = torch.clamp(
-            (lengths + self.DOWNSAMPLE_FACTOR - 1) // self.DOWNSAMPLE_FACTOR,
+            (lengths + self.STEM_STRIDE - 1) // self.STEM_STRIDE,
             min=1,
             max=t_frames,
         )
@@ -177,17 +188,39 @@ class WaveformMILNet(nn.Module):
         for blk in self.blocks:
             x = blk(x, frame_mask)
 
+        # Downsample 8x (250 Hz -> 31.25 Hz) preserving both peak transients (max) & flow energy (avg)
+        if x.shape[-1] < self.RHYTHM_STRIDE:
+            x = F.pad(x, (0, self.RHYTHM_STRIDE - x.shape[-1]))
+        x_avg = F.avg_pool1d(
+            x, kernel_size=self.RHYTHM_STRIDE, stride=self.RHYTHM_STRIDE, ceil_mode=True
+        )
+        neg_fill = torch.where(frame_mask > 0.5, x, torch.full_like(x, -1e4))
+        x_max = F.max_pool1d(
+            neg_fill, kernel_size=self.RHYTHM_STRIDE, stride=self.RHYTHM_STRIDE, ceil_mode=True
+        )
+        t_rhythm = min(x_avg.shape[-1], x_max.shape[-1])
+        rhythm_lengths = torch.clamp(
+            (frame_lengths + self.RHYTHM_STRIDE - 1) // self.RHYTHM_STRIDE,
+            min=1,
+            max=t_rhythm,
+        )
+        rhythm_mask = make_length_mask(rhythm_lengths, t_rhythm).to(x.dtype).unsqueeze(1)
+        r = (
+            self.rhythm_proj(torch.cat([x_avg[..., :t_rhythm], x_max[..., :t_rhythm]], dim=1))
+            * rhythm_mask
+        )
+
         packed = pack_padded_sequence(
-            x.transpose(1, 2),
-            frame_lengths.detach().cpu(),
+            r.transpose(1, 2),
+            rhythm_lengths.detach().cpu(),
             batch_first=True,
             enforce_sorted=False,
         )
         gru_out_packed, _ = self.gru(packed)
-        gru_out, _ = pad_packed_sequence(gru_out_packed, batch_first=True, total_length=t_frames)
-        x = self.post_norm(x + gru_out.transpose(1, 2)) * frame_mask
+        gru_out, _ = pad_packed_sequence(gru_out_packed, batch_first=True, total_length=t_rhythm)
+        r = self.post_norm(r + gru_out.transpose(1, 2)) * rhythm_mask
 
-        pooled, attn_weights = self.pool(x, frame_lengths)
+        pooled, attn_weights = self.pool(r, rhythm_lengths)
         h = self.head_drop(self.head_norm(pooled))
         return {
             "logits": self.binary_head(h).squeeze(-1),

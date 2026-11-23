@@ -44,6 +44,7 @@ def _discover_model_runs(
         ("gbdt_dsp_blend", runs_root / "family1_dsp" / "gbdt_dsp_blend"),
         ("waveform_mil", runs_root / "waveform_mil_5fold"),
         ("spec_tempogram_mil", runs_root / "spec_tempogram_mil_5fold"),
+        ("spec_tempogram_seresnext", runs_root / "spec_tempogram_seresnext_5fold"),
     ]
     for name, folder in candidates:
         oof_pq = folder / "oof_predictions.parquet"
@@ -81,7 +82,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Primary representative from each distinct model family for clean multi-family fusion
     primary_keys = [
-        k for k in ("gbdt_dsp_blend", "waveform_mil", "spec_tempogram_mil") if k in oof_all
+        k
+        for k in (
+            "gbdt_dsp_blend",
+            "waveform_mil",
+            "spec_tempogram_mil",
+            "spec_tempogram_seresnext",
+        )
+        if k in oof_all
     ]
     primary_oof = {k: oof_all[k] for k in primary_keys}
     primary_tst = {k: tst_all[k] for k in primary_keys}

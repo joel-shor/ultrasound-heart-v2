@@ -1,0 +1,38 @@
+name: spec_tempogram_seresnext_5fold
+folds: [0, 1, 2, 3, 4]
+
+data:
+  train_window_seconds: 20.0
+  crops_per_recording_epoch: 2
+  batch_size: 32
+  eval_batch_size: 16
+  num_workers: 4
+  augment: true
+
+model:
+  name: spec_tempogram_mil
+  channels: 160
+  dropout: 0.30
+  topk_pool: 6
+  pretrained: true
+  backbone: seresnext50_32x4d
+
+optim:
+  lr: 0.0006
+  backbone_lr_scale: 0.25
+  weight_decay: 0.02
+  epochs: 26
+  warmup_epochs: 4
+  focal_gamma: 1.5
+  pos_weight_scale: 0.35
+  auc_loss_weight: 0.40
+  subtype_loss_weight: 0.15
+  mixup_alpha: 0.20
+  early_stopping_patience: 8
+  mixed_precision: true
+
+beaker:
+  gpus: 1
+  shared_memory: 16GiB
+  task_timeout: 4h
+  task_name: spec_tempogram_seresnext
