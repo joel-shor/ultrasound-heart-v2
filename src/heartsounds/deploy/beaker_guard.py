@@ -188,13 +188,38 @@ def _extract_job_gpus(job: Mapping[str, Any]) -> int:
     return 1
 
 
+def _is_project_job(job: Mapping[str, Any], repo_slug: str = "ultrasound-heart-v2") -> bool:
+    """Return True if `job` belongs to this repository (or lacks `execution` metadata in tests)."""
+    execution = job.get("execution")
+    if not isinstance(execution, Mapping):
+        return True
+    spec = execution.get("spec")
+    if not isinstance(spec, Mapping):
+        return True
+    env_vars = spec.get("envVars")
+    if not isinstance(env_vars, list):
+        return True
+
+    env_map = {
+        str(item.get("name", "")): str(item.get("value", ""))
+        for item in env_vars
+        if isinstance(item, Mapping)
+    }
+    if env_map.get("HEARTSOUNDS_PROJECT") == repo_slug:
+        return True
+    gh_repo = env_map.get("GITHUB_REPO", "")
+    if gh_repo:
+        return gh_repo.endswith(f"/{repo_slug}") or gh_repo == repo_slug
+    return str(job.get("name", "")).startswith("hs2-")
+
+
 def count_active_user_gpus(
     clusters: Sequence[str],
     *,
     author: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> int:
-    """Count total GPUs across all non-finalized execution jobs for `author` across `clusters`."""
+    """Count total GPUs across all non-finalized `ultrasound-heart-v2` jobs for `author`."""
     who = author or resolve_beaker_author(runner=runner)
     seen_jobs: dict[str, int] = {}
     for cluster in clusters:
@@ -224,6 +249,8 @@ def count_active_user_gpus(
         for job in jobs:
             status = job.get("status") or {}
             if status.get("finalized") or status.get("exited") or status.get("canceled"):
+                continue
+            if not _is_project_job(job):
                 continue
             job_id = str(job.get("id", ""))
             if job_id and job_id not in seen_jobs:
@@ -318,6 +345,8 @@ def build_gantry_argv(
         "PYTHONUNBUFFERED=1",
         "--env",
         "MPLBACKEND=Agg",
+        "--env",
+        "HEARTSOUNDS_PROJECT=ultrasound-heart-v2",
     ]
     for cluster in bcfg.cluster:
         argv += ["--cluster", cluster]

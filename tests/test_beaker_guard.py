@@ -66,12 +66,38 @@ def test_gpu_guard_blocks_more_than_2_concurrent_gpus():
     with pytest.raises(LaunchPreflightError, match="exceeds per-project maximum"):
         enforce_gpu_budget(3, ("ai1/octo.ai-aws-p5en",), author="joel-shor")
 
-    # Simulate 2 active 1-GPU jobs (same job_1 duplicated across 2 cluster queries + job_2)
+    # Simulate 2 active 1-GPU project jobs + 1 unrelated repo job (`binder-evaluation`)
     def fake_runner(cmd: list[str], **kwargs):
         cluster = cmd[cmd.index("--cluster") + 1]
         if cluster == "ai1/octo.ai-aws-p5en":
             payload = [
-                {"id": "job_1", "status": {}, "limits": {"gpuCount": 1}},
+                {
+                    "id": "job_1",
+                    "status": {},
+                    "limits": {"gpuCount": 1},
+                    "execution": {
+                        "spec": {
+                            "envVars": [
+                                {"name": "GITHUB_REPO", "value": "joel-shor/ultrasound-heart-v2"}
+                            ]
+                        }
+                    },
+                },
+                {
+                    "id": "job_other_repo",
+                    "status": {},
+                    "limits": {"gpuCount": 8},
+                    "execution": {
+                        "spec": {
+                            "envVars": [
+                                {
+                                    "name": "GITHUB_REPO",
+                                    "value": "AIBioDesign-Allen/binder-evaluation",
+                                }
+                            ]
+                        }
+                    },
+                },
                 {
                     "id": "job_done",
                     "status": {"finalized": "2026-11-23T00:00:00Z"},
