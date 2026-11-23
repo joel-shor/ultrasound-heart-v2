@@ -348,14 +348,11 @@ def build_gantry_argv(
         argv += ["--timeout", "0"]
 
     if mode == "hello":
-        payload = ["uv", "run", "--no-sync", "python", "-m", "heartsounds.deploy.hello"]
+        payload = ["python", "-m", "heartsounds.deploy.hello"]
     elif mode == "train":
         if not config_rel_path:
             raise LaunchPreflightError("mode='train' requires config_rel_path")
         payload = [
-            "uv",
-            "run",
-            "--no-sync",
             "python",
             "-m",
             "heartsounds.training.run_cv",

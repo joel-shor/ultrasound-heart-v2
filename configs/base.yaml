@@ -48,4 +48,5 @@ beaker:
   docker_image: python:3.12-bookworm
   task_timeout: 4h
   task_name: train
-  install: UV_CACHE_DIR=/tmp/uv-cache uv sync --locked
+  # Unset: Gantry 3.7 auto-detects pyproject.toml + uv.lock and activates its managed venv.
+  install: null

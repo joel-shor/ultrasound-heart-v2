@@ -52,8 +52,8 @@ The canonical skill lives at `.agents/skills/beaker/SKILL.md` (symlinked at `.cl
 
 ## 3. Critical `ai1/*` Cluster & Gantry Rules
 
-1. **Always specify a public `--docker-image` (`python:3.12-bookworm`):**
-   - Gantry defaults to `ai2/conda`, which `ai1/*` clusters cannot pull. `scripts/launch.py` always emits `--docker-image python:3.12-bookworm` (or the recipe's explicit public image) and syncs `pyproject.toml` + `uv.lock` via `uv`.
+1. **Always specify a public `--docker-image` (`python:3.12-bookworm`) and leave `beaker.install: null`:**
+   - Gantry defaults to `ai2/conda`, which `ai1/*` clusters cannot pull. `scripts/launch.py` always emits `--docker-image python:3.12-bookworm` (or the recipe's explicit public image), and Gantry 3.7 auto-detects `pyproject.toml` + `uv.lock`, installs dependencies into its managed `uv` virtualenv, and puts `python` first on `PATH`.
 2. **Never pass `--memory` on GPU clusters; only pass `--shared-memory`:**
    - Requesting system RAM via `--memory` can cause Beaker's slot allocator to reserve multiple GPU slots. `scripts/launch.py` never emits `--memory`; size `/dev/shm` via `beaker.shared_memory` (e.g., `16GiB`).
 3. **Multi-Cluster Routing for Zero Queue Wait:**

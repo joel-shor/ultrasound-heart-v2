@@ -73,7 +73,7 @@ class BeakerConfig:
     docker_image: str = "python:3.12-bookworm"
     task_timeout: str = "6h"
     task_name: str = "train"
-    install: str | None = "UV_CACHE_DIR=/tmp/uv-cache uv sync --locked"
+    install: str | None = None
 
 
 @dataclass(frozen=True)
