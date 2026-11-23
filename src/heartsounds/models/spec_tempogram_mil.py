@@ -148,7 +148,8 @@ class SpecTempogramMILNet(nn.Module):
             out_indices=(2, 3),
         )
         feat_channels = self.encoder.feature_info.channels()
-        # Mean + Max over frequency axis on both Stage-3 (stride 16) and Stage-4 (stride 32)
+        self.stage_stride = int(self.encoder.feature_info.reduction()[0])
+        # Mean + Max over frequency axis on both selected stages (e.g. stride 16/32 or 8/16)
         fused_in = 2 * (feat_channels[0] + feat_channels[1])
         proj_dim = int(cfg.channels) * 2
 
@@ -196,7 +197,11 @@ class SpecTempogramMILNet(nn.Module):
             align_corners=False,
         )
         t3_len = s3_t.shape[-1]
-        out_lengths = torch.clamp((spec_lengths + 15) // 16, min=1, max=t3_len)
+        out_lengths = torch.clamp(
+            (spec_lengths + self.stage_stride - 1) // self.stage_stride,
+            min=1,
+            max=t3_len,
+        )
         mask_b1t = make_length_mask(out_lengths, t3_len).to(s3_t.dtype).unsqueeze(1)
 
         seq = self.temporal_neck(torch.cat([s3_t, s4_t], dim=1) * mask_b1t) * mask_b1t

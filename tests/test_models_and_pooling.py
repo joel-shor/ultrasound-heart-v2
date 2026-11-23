@@ -61,3 +61,31 @@ def test_waveform_and_spec_tempogram_models_forward_and_backward_cpu():
             float(p.grad.norm().item()) for p in model.parameters() if p.grad is not None
         )
         assert grad_norm > 0.0
+
+
+def test_spec_tempogram_mask_matches_backbone_reduction_stride():
+    """Ensure stride-8 backbones (e.g. resnet/seresnext) attend across the full clip, not half."""
+    torch.manual_seed(11)
+    wavs = torch.randn(2, 40000)  # 10s @ 4 kHz -> 501 spec frames
+    lens = torch.tensor([40000, 16000], dtype=torch.long)  # 10s and 4s
+
+    for backbone, expected_stride in (("resnet18", 8), ("convnext_tiny", 16)):
+        model = build_model(
+            ModelConfig(
+                name="spec_tempogram_mil",
+                channels=32,
+                dropout=0.0,
+                topk_pool=3,
+                pretrained=False,
+                backbone=backbone,
+            )
+        )
+        model.eval()
+        assert model.stage_stride == expected_stride
+        with torch.no_grad():
+            attn = model(wavs, lens)["attn_weights"]
+        t_len = attn.shape[1]
+        # Full-length clip must place non-zero attention weight in its second half
+        assert float(attn[0, t_len // 2 :].sum().item()) > 0.1
+        # Shorter clip (40% length) must place zero attention in the padded tail
+        assert float(attn[1, int(t_len * 0.55) :].sum().item()) == 0.0

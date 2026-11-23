@@ -15,7 +15,11 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from heartsounds.eval.ensemble import build_all_ensembles_and_ablations  # noqa: E402
+from heartsounds.eval.ensemble import (  # noqa: E402
+    build_all_ensembles_and_ablations,
+    fit_nested_simplex_logit_blend,
+    fit_nested_stacker,
+)
 from heartsounds.eval.metrics import evaluate_binary_suite  # noqa: E402
 from heartsounds.eval.plots import (  # noqa: E402
     plot_confusion_and_subtypes,
@@ -97,6 +101,27 @@ def main(argv: list[str] | None = None) -> int:
     ensembles, quar_blend = build_all_ensembles_and_ablations(
         primary_oof, primary_tst, quarantine_tables=quar_all
     )
+    neural_keys = [
+        k
+        for k in ("waveform_mil", "spec_tempogram_mil", "spec_tempogram_seresnext")
+        if k in oof_all
+    ]
+    quar_neural_blend = None
+    if len(neural_keys) >= 2:
+        n_blend, quar_neural_blend = fit_nested_simplex_logit_blend(
+            {k: oof_all[k] for k in neural_keys},
+            {k: tst_all[k] for k in neural_keys},
+            ensemble_name="neural_2family_logit_blend",
+            quarantine_tables=quar_all,
+        )
+        n_stack = fit_nested_stacker(
+            {k: oof_all[k] for k in neural_keys},
+            {k: tst_all[k] for k in neural_keys},
+            ensemble_name="neural_2family_stacker",
+        )
+        ensembles[n_blend.name] = n_blend
+        ensembles[n_stack.name] = n_stack
+
     for ens_name, ens_out in ensembles.items():
         oof_all[ens_name] = ens_out.oof_df
         tst_all[ens_name] = ens_out.test_df
@@ -119,11 +144,12 @@ def main(argv: list[str] | None = None) -> int:
         q_oof = odf["recording_id"].map(quality_by_id).to_numpy(dtype=float)
         q_tst = tdf["recording_id"].map(quality_by_id).to_numpy(dtype=float)
 
-        q_df = (
-            quar_blend
-            if (m_name == "fusion_3family_logit_blend" and quar_blend is not None)
-            else quar_all.get(m_name)
-        )
+        if m_name == "neural_2family_logit_blend" and quar_neural_blend is not None:
+            q_df = quar_neural_blend
+        elif m_name == "fusion_3family_logit_blend" and quar_blend is not None:
+            q_df = quar_blend
+        else:
+            q_df = quar_all.get(m_name)
         q_qual = (
             q_df["recording_id"].map(quality_by_id).to_numpy(dtype=float)
             if q_df is not None
@@ -193,7 +219,11 @@ def main(argv: list[str] | None = None) -> int:
     # Generate diagnostic plots
     plot_keys = [
         k
-        for k in (*primary_keys, "fusion_3family_logit_blend", "fusion_3family_stacker")
+        for k in (
+            *primary_keys,
+            "neural_2family_logit_blend",
+            "neural_2family_stacker",
+        )
         if k in tst_all
     ]
     plot_roc_and_pr_frontiers(
