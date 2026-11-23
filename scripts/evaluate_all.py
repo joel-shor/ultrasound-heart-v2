@@ -36,20 +36,32 @@ from heartsounds.storage.gcs import (  # noqa: E402
 
 def _discover_model_runs(
     runs_root: Path,
+    *,
+    suite: str = "v0",
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     oof_map: dict[str, pd.DataFrame] = {}
     tst_map: dict[str, pd.DataFrame] = {}
     quar_map: dict[str, pd.DataFrame] = {}
 
-    candidates = [
-        ("logreg_dsp", runs_root / "family1_dsp" / "logreg_dsp"),
-        ("xgboost_dsp", runs_root / "family1_dsp" / "xgboost_dsp"),
-        ("lightgbm_dsp", runs_root / "family1_dsp" / "lightgbm_dsp"),
-        ("gbdt_dsp_blend", runs_root / "family1_dsp" / "gbdt_dsp_blend"),
-        ("waveform_mil", runs_root / "waveform_mil_5fold"),
-        ("spec_tempogram_mil", runs_root / "spec_tempogram_mil_5fold"),
-        ("spec_tempogram_seresnext", runs_root / "spec_tempogram_seresnext_5fold"),
-    ]
+    if suite == "v1":
+        candidates = [
+            ("v1_2d_convnext_tiny_scratch", runs_root / "v1_2d_convnext_tiny_scratch"),
+            ("v1_2d_convnext_tiny_imagenet", runs_root / "v1_2d_convnext_tiny_imagenet"),
+            ("v1_2d_convnext_tiny_audioset", runs_root / "v1_2d_convnext_tiny_audioset"),
+            ("v1_2d_convnext_tiny_doppler_ssl", runs_root / "v1_2d_convnext_tiny_doppler_ssl"),
+            ("v1_1d_waveform_scratch", runs_root / "v1_1d_waveform_scratch"),
+            ("v1_1d_waveform_doppler_ssl", runs_root / "v1_1d_waveform_doppler_ssl"),
+        ]
+    else:
+        candidates = [
+            ("logreg_dsp", runs_root / "family1_dsp" / "logreg_dsp"),
+            ("xgboost_dsp", runs_root / "family1_dsp" / "xgboost_dsp"),
+            ("lightgbm_dsp", runs_root / "family1_dsp" / "lightgbm_dsp"),
+            ("gbdt_dsp_blend", runs_root / "family1_dsp" / "gbdt_dsp_blend"),
+            ("waveform_mil", runs_root / "waveform_mil_5fold"),
+            ("spec_tempogram_mil", runs_root / "spec_tempogram_mil_5fold"),
+            ("spec_tempogram_seresnext", runs_root / "spec_tempogram_seresnext_5fold"),
+        ]
     for name, folder in candidates:
         oof_pq = folder / "oof_predictions.parquet"
         tst_pq = folder / "test_predictions.parquet"
@@ -62,65 +74,103 @@ def _discover_model_runs(
     return oof_map, tst_map, quar_map
 
 
+def _oof_composite(df: pd.DataFrame) -> float:
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    y = df["y_true"].to_numpy()
+    p = df["y_prob"].to_numpy()
+    return 0.5 * float(roc_auc_score(y, p)) + 0.5 * float(average_precision_score(y, p))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate standalone models and fused ensembles.")
+    parser.add_argument("--suite", choices=("v0", "v1"), default="v0")
     parser.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data" / "v2_curated")
     parser.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "outputs" / "runs")
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "outputs" / "evaluation")
     parser.add_argument("--n-boot", type=int, default=1000)
     parser.add_argument("--upload-gcs", action="store_true")
-    parser.add_argument("--gcs-dest", default=f"{CURATED_GCS_ROOT}/predictions")
+    parser.add_argument("--gcs-dest", default=None)
     parser.add_argument("--gcp-project", default=DEFAULT_GCP_PROJECT)
     args = parser.parse_args(argv)
 
+    gcs_dest = args.gcs_dest or (
+        f"{CURATED_GCS_ROOT}/predictions_v1"
+        if args.suite == "v1"
+        else f"{CURATED_GCS_ROOT}/predictions"
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     manifest_df = pd.read_parquet(args.data_dir / "manifest.parquet")
     dsp_df = pd.read_parquet(args.data_dir / "dsp_features.parquet")
     quality_by_id = dsp_df.set_index("recording_id")["quality_r_peak_mean"].to_dict()
     uri_by_id = manifest_df.set_index("recording_id")["primary_raw_gcs_uri"].to_dict()
 
-    oof_all, tst_all, quar_all = _discover_model_runs(args.runs_dir)
+    oof_all, tst_all, quar_all = _discover_model_runs(args.runs_dir, suite=args.suite)
     if not oof_all:
-        raise RuntimeError(f"No completed model runs discovered under {args.runs_dir}")
-    print(f"[eval] Discovered standalone models: {list(oof_all.keys())}", flush=True)
+        raise RuntimeError(f"No completed {args.suite} model runs discovered under {args.runs_dir}")
+    print(f"[eval] Discovered standalone {args.suite} models: {list(oof_all.keys())}", flush=True)
 
-    # Primary representative from each distinct model family for clean multi-family fusion
-    primary_keys = [
-        k
-        for k in (
-            "gbdt_dsp_blend",
-            "waveform_mil",
-            "spec_tempogram_mil",
-            "spec_tempogram_seresnext",
-        )
-        if k in oof_all
-    ]
-    primary_oof = {k: oof_all[k] for k in primary_keys}
-    primary_tst = {k: tst_all[k] for k in primary_keys}
-
-    ensembles, quar_blend = build_all_ensembles_and_ablations(
-        primary_oof, primary_tst, quarantine_tables=quar_all
-    )
-    neural_keys = [
-        k
-        for k in ("waveform_mil", "spec_tempogram_mil", "spec_tempogram_seresnext")
-        if k in oof_all
-    ]
+    ensembles = {}
+    quar_blend = None
     quar_neural_blend = None
-    if len(neural_keys) >= 2:
-        n_blend, quar_neural_blend = fit_nested_simplex_logit_blend(
-            {k: oof_all[k] for k in neural_keys},
-            {k: tst_all[k] for k in neural_keys},
-            ensemble_name="neural_2family_logit_blend",
-            quarantine_tables=quar_all,
+    primary_keys: list[str] = []
+
+    if args.suite == "v1":
+        v1_2d_keys = [k for k in oof_all if k.startswith("v1_2d_")]
+        v1_1d_keys = [k for k in oof_all if k.startswith("v1_1d_")]
+        primary_keys = list(oof_all.keys())
+        best_2d = max(v1_2d_keys, key=lambda k: _oof_composite(oof_all[k])) if v1_2d_keys else None
+        best_1d = max(v1_1d_keys, key=lambda k: _oof_composite(oof_all[k])) if v1_1d_keys else None
+        if best_2d and best_1d:
+            n_blend, quar_neural_blend = fit_nested_simplex_logit_blend(
+                {best_2d: oof_all[best_2d], best_1d: oof_all[best_1d]},
+                {best_2d: tst_all[best_2d], best_1d: tst_all[best_1d]},
+                ensemble_name="v1_best_2d_plus_1d_logit_blend",
+                quarantine_tables=quar_all,
+            )
+            n_stack = fit_nested_stacker(
+                {best_2d: oof_all[best_2d], best_1d: oof_all[best_1d]},
+                {best_2d: tst_all[best_2d], best_1d: tst_all[best_1d]},
+                ensemble_name="v1_best_2d_plus_1d_stacker",
+            )
+            ensembles[n_blend.name] = n_blend
+            ensembles[n_stack.name] = n_stack
+    else:
+        primary_keys = [
+            k
+            for k in (
+                "gbdt_dsp_blend",
+                "waveform_mil",
+                "spec_tempogram_mil",
+                "spec_tempogram_seresnext",
+            )
+            if k in oof_all
+        ]
+        primary_oof = {k: oof_all[k] for k in primary_keys}
+        primary_tst = {k: tst_all[k] for k in primary_keys}
+
+        ensembles, quar_blend = build_all_ensembles_and_ablations(
+            primary_oof, primary_tst, quarantine_tables=quar_all
         )
-        n_stack = fit_nested_stacker(
-            {k: oof_all[k] for k in neural_keys},
-            {k: tst_all[k] for k in neural_keys},
-            ensemble_name="neural_2family_stacker",
-        )
-        ensembles[n_blend.name] = n_blend
-        ensembles[n_stack.name] = n_stack
+        neural_keys = [
+            k
+            for k in ("waveform_mil", "spec_tempogram_mil", "spec_tempogram_seresnext")
+            if k in oof_all
+        ]
+        if len(neural_keys) >= 2:
+            n_blend, quar_neural_blend = fit_nested_simplex_logit_blend(
+                {k: oof_all[k] for k in neural_keys},
+                {k: tst_all[k] for k in neural_keys},
+                ensemble_name="neural_2family_logit_blend",
+                quarantine_tables=quar_all,
+            )
+            n_stack = fit_nested_stacker(
+                {k: oof_all[k] for k in neural_keys},
+                {k: tst_all[k] for k in neural_keys},
+                ensemble_name="neural_2family_stacker",
+            )
+            ensembles[n_blend.name] = n_blend
+            ensembles[n_stack.name] = n_stack
 
     for ens_name, ens_out in ensembles.items():
         oof_all[ens_name] = ens_out.oof_df
@@ -144,7 +194,10 @@ def main(argv: list[str] | None = None) -> int:
         q_oof = odf["recording_id"].map(quality_by_id).to_numpy(dtype=float)
         q_tst = tdf["recording_id"].map(quality_by_id).to_numpy(dtype=float)
 
-        if m_name == "neural_2family_logit_blend" and quar_neural_blend is not None:
+        if (
+            m_name in ("neural_2family_logit_blend", "v1_best_2d_plus_1d_logit_blend")
+            and quar_neural_blend is not None
+        ):
             q_df = quar_neural_blend
         elif m_name == "fusion_3family_logit_blend" and quar_blend is not None:
             q_df = quar_blend
@@ -221,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         k
         for k in (
             *primary_keys,
+            "v1_best_2d_plus_1d_logit_blend",
             "neural_2family_logit_blend",
             "neural_2family_stacker",
         )
@@ -241,8 +295,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.upload_gcs:
-        uploaded = upload_directory_to_gcs(args.out_dir, args.gcs_dest, project=args.gcp_project)
-        print(f"[eval] Uploaded {len(uploaded)} evaluation files to {args.gcs_dest}", flush=True)
+        uploaded = upload_directory_to_gcs(args.out_dir, gcs_dest, project=args.gcp_project)
+        print(f"[eval] Uploaded {len(uploaded)} evaluation files to {gcs_dest}", flush=True)
 
     return 0
 

@@ -20,6 +20,7 @@ from heartsounds.data.torch_dataset import (
     masked_waveform_collate,
 )
 from heartsounds.models.losses import CompositeDopplerLoss
+from heartsounds.models.pretrain import run_fold_masked_ssl_pretrain
 from heartsounds.models.registry import build_model
 
 OVERSAMPLE_FACTOR = 3.0
@@ -184,6 +185,28 @@ def train_single_fold(
     )
 
     model = build_model(cfg.model).to(device)
+
+    if cfg.optim.ssl_epochs > 0:
+        ssl_ds = HeartSoundsDataset(
+            train_df,
+            sample_rate=cfg.data.sample_rate,
+            window_seconds=cfg.data.train_window_seconds,
+            is_train=True,
+            augment=cfg.data.augment,
+            crops_per_recording=1,
+            seed=seed + 17,
+        )
+        ssl_loader = DataLoader(
+            ssl_ds,
+            batch_size=cfg.data.batch_size,
+            shuffle=True,
+            num_workers=cfg.data.num_workers,
+            collate_fn=masked_waveform_collate,
+            pin_memory=(device.type == "cuda"),
+            drop_last=(len(ssl_ds) > cfg.data.batch_size),
+        )
+        run_fold_masked_ssl_pretrain(model, ssl_loader, cfg, device, fold_name=fold_name)
+
     optimizer = _build_optimizer(model, cfg)
 
     n_pos = max(1, int((train_df["curated_label"] == 1).sum()))

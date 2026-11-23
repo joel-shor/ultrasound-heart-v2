@@ -2,9 +2,11 @@
 
 Processes 4,000 Hz fetal Doppler waveforms through two complementary 250 Hz branches:
 1. Learned strided Conv1D waveform stem capturing beat/valve morphology.
-2. Multi-band (low/mid/high) + Shannon log-energy envelope branch capturing beat energy.
-Fused features pass through dilated 1D ConvNeXt blocks (receptive field ~4.5s), a packed
-2-layer BiGRU for beat-to-beat sequential rhythm state, and `MaskedGatedAttentionMILPool`.
+2. Multi-band (low/mid/high) + log-energy (+ optional instantaneous carrier frequency in `v1`)
+   envelope branch capturing beat energy and Doppler velocity shift.
+Fused features pass through dilated 1D ConvNeXt blocks, an 8x Max+Mean rhythm pool
+(`250 Hz -> 31.25 Hz`, ~14 frames/heartbeat), a packed 2-layer BiGRU for beat-to-beat
+sequential rhythm state, and `MaskedGatedAttentionMILPool`.
 """
 
 from __future__ import annotations
@@ -31,19 +33,21 @@ class ChannelLayerNorm1D(nn.Module):
 
 
 class MultiBandEnvelopeFrontend1D(nn.Module):
-    """Fast, differentiable on-GPU multi-scale energy envelope extractor (4000 Hz -> 250 Hz)."""
+    """Fast, differentiable on-GPU multi-scale energy (+ instantaneous frequency) extractor."""
 
-    def __init__(self, out_channels: int) -> None:
+    def __init__(self, out_channels: int, *, inst_freq_channel: bool = False) -> None:
         super().__init__()
+        self.inst_freq_channel = bool(inst_freq_channel)
+        self.num_env_channels = 5 if self.inst_freq_channel else 4
         self.proj = nn.Sequential(
-            nn.Conv1d(4, out_channels, kernel_size=5, padding=2),
+            nn.Conv1d(self.num_env_channels, out_channels, kernel_size=5, padding=2),
             ChannelLayerNorm1D(out_channels),
             nn.GELU(),
         )
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+    def extract_raw_envelope(self, wav: torch.Tensor) -> torch.Tensor:
+        """Compute `(B, num_env_channels, T_250hz)` strictly non-negative envelope features."""
         x = wav.unsqueeze(1)  # (B, 1, T_samples)
-        # Difference-of-moving-averages approximates low, mid, and high Doppler bands cleanly on GPU
         lp_150 = F.avg_pool1d(x, kernel_size=27, stride=1, padding=13)
         lp_600 = F.avg_pool1d(x, kernel_size=7, stride=1, padding=3)
         band_low = lp_150
@@ -53,18 +57,28 @@ class MultiBandEnvelopeFrontend1D(nn.Module):
         sq = x.clamp(-12.0, 12.0).pow(2)
         log_energy = torch.log1p(4.0 * sq)
 
-        stacked = torch.cat(
-            [band_low.abs(), band_mid.abs(), band_high.abs(), log_energy],
-            dim=1,
-        )  # (B, 4, T_samples)
-        # Smooth & downsample 16x (4000 Hz -> 250 Hz) matching the learned waveform stem
+        channels = [band_low.abs(), band_mid.abs(), band_high.abs(), log_energy]
+        stacked = torch.cat(channels, dim=1)  # (B, 4, T_samples)
         pooled = F.avg_pool1d(stacked, kernel_size=32, stride=16, padding=8).clamp(min=0.0)
         env_250 = torch.log1p(pooled)
-        return self.proj(env_250)
+
+        if self.inst_freq_channel:
+            dx = torch.zeros_like(x)
+            if x.shape[-1] > 1:
+                dx[..., 1:] = (x[..., 1:] - x[..., :-1]).abs()
+            dx_pool = F.avg_pool1d(dx, kernel_size=32, stride=16, padding=8).clamp(min=0.0)
+            abs_pool = F.avg_pool1d(x.abs(), kernel_size=32, stride=16, padding=8).clamp(min=0.0)
+            # Instantaneous carrier frequency proxy: high for valve clicks / fast Doppler velocity
+            inst_freq = torch.log1p(dx_pool / (abs_pool + 1e-3)).clamp(max=4.0)
+            env_250 = torch.cat([env_250, inst_freq], dim=1)
+        return env_250
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.extract_raw_envelope(wav))
 
 
 class DilatedConvNeXtBlock1D(nn.Module):
-    """1D ConvNeXt block with dilated depthwise conv, Squeeze-Excite, and mask zeroing."""
+    """1D ConvNeXt block with dilated depthwise conv and strict mask zeroing."""
 
     def __init__(
         self,
@@ -124,14 +138,16 @@ class WaveformMILNet(nn.Module):
             ChannelLayerNorm1D(half),
             nn.GELU(),
         )
-        self.env_stem = MultiBandEnvelopeFrontend1D(ch - half)
+        self.env_stem = MultiBandEnvelopeFrontend1D(
+            ch - half, inst_freq_channel=cfg.inst_freq_channel
+        )
         self.fuse = nn.Sequential(
             nn.Conv1d(ch, ch, kernel_size=1),
             ChannelLayerNorm1D(ch),
             nn.GELU(),
         )
 
-        dilations = (1, 2, 4, 8, 16, 4)
+        dilations = (1, 2, 4, 8, 16, 32) if cfg.inst_freq_channel else (1, 2, 4, 8, 16, 4)
         self.blocks = nn.ModuleList(
             [
                 DilatedConvNeXtBlock1D(ch, kernel_size=9, dilation=d, dropout=cfg.dropout)
@@ -164,11 +180,30 @@ class WaveformMILNet(nn.Module):
         self.binary_head = nn.Linear(pooled_dim, 1)
         self.subtype_head = nn.Linear(pooled_dim, len(SUBTYPE_TO_INDEX))
 
-    def forward(
+    def extract_target_envelope(
         self,
         waveforms: torch.Tensor,
         lengths: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return `(env_250hz, frame_lengths)` for masked 1D SSL pretraining."""
+        sample_mask = make_length_mask(lengths, waveforms.shape[1]).to(waveforms.dtype)
+        clean_wav = waveforms * sample_mask
+        env_250 = self.env_stem.extract_raw_envelope(clean_wav)
+        t_frames = env_250.shape[-1]
+        frame_lengths = torch.clamp(
+            (lengths + self.STEM_STRIDE - 1) // self.STEM_STRIDE,
+            min=1,
+            max=t_frames,
+        )
+        frame_mask = make_length_mask(frame_lengths, t_frames).to(env_250.dtype).unsqueeze(1)
+        return env_250 * frame_mask, frame_lengths
+
+    def encode_rhythm_sequence(
+        self,
+        waveforms: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode raw waveforms to `(B, C, T_rhythm)` at 31.25 Hz and `rhythm_lengths`."""
         sample_mask = make_length_mask(lengths, waveforms.shape[1]).to(waveforms.dtype)
         clean_wav = waveforms * sample_mask
 
@@ -188,9 +223,10 @@ class WaveformMILNet(nn.Module):
         for blk in self.blocks:
             x = blk(x, frame_mask)
 
-        # Downsample 8x (250 Hz -> 31.25 Hz) preserving both peak transients (max) & flow energy (avg)
         if x.shape[-1] < self.RHYTHM_STRIDE:
-            x = F.pad(x, (0, self.RHYTHM_STRIDE - x.shape[-1]))
+            pad_r = self.RHYTHM_STRIDE - x.shape[-1]
+            x = F.pad(x, (0, pad_r))
+            frame_mask = F.pad(frame_mask, (0, pad_r))
         x_avg = F.avg_pool1d(
             x, kernel_size=self.RHYTHM_STRIDE, stride=self.RHYTHM_STRIDE, ceil_mode=True
         )
@@ -205,10 +241,9 @@ class WaveformMILNet(nn.Module):
             max=t_rhythm,
         )
         rhythm_mask = make_length_mask(rhythm_lengths, t_rhythm).to(x.dtype).unsqueeze(1)
-        r = (
-            self.rhythm_proj(torch.cat([x_avg[..., :t_rhythm], x_max[..., :t_rhythm]], dim=1))
-            * rhythm_mask
-        )
+        x_avg_clean = x_avg[..., :t_rhythm] * rhythm_mask
+        x_max_clean = x_max[..., :t_rhythm] * rhythm_mask
+        r = self.rhythm_proj(torch.cat([x_avg_clean, x_max_clean], dim=1)) * rhythm_mask
 
         packed = pack_padded_sequence(
             r.transpose(1, 2),
@@ -219,7 +254,14 @@ class WaveformMILNet(nn.Module):
         gru_out_packed, _ = self.gru(packed)
         gru_out, _ = pad_packed_sequence(gru_out_packed, batch_first=True, total_length=t_rhythm)
         r = self.post_norm(r + gru_out.transpose(1, 2)) * rhythm_mask
+        return r, rhythm_lengths
 
+    def forward(
+        self,
+        waveforms: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        r, rhythm_lengths = self.encode_rhythm_sequence(waveforms, lengths)
         pooled, attn_weights = self.pool(r, rhythm_lengths)
         h = self.head_drop(self.head_norm(pooled))
         return {

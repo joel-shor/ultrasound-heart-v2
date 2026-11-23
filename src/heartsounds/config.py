@@ -36,6 +36,15 @@ class ModelConfig:
     topk_pool: int = 6
     pretrained: bool = True
     backbone: str = "convnext_small.fb_in22k"
+    init_mode: str = (
+        "auto"  # auto | scratch | imagenet | audioset | doppler_ssl | audioset_doppler_ssl
+    )
+    audioset_repo: str = "topel/ConvNeXt-Tiny-AT"
+    n_mels: int = 64
+    decoupled_tempogram: bool = False
+    freq_subbands: int = 1
+    temporal_gru: bool = False
+    inst_freq_channel: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,9 @@ class OptimConfig:
     mixup_alpha: float = 0.2
     early_stopping_patience: int = 8
     mixed_precision: bool = True
+    ssl_epochs: int = 0
+    ssl_lr: float = 1.0e-3
+    ssl_mask_ratio: float = 0.60
 
 
 @dataclass(frozen=True)
